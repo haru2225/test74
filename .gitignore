@@ -1,0 +1,5 @@
+data_crystal_1000/
+data_glass_1000/
+output/
+__pycache__/
+*.pyc
