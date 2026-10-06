@@ -1,0 +1,16 @@
+
+=== Told T=300K (matches crystal training) (condition T=300.0 K, actual thermostat T=300.0 K) ===
+  initial  nn_mean=2.9535 A  nn_min=2.8533 A  nn_std=0.0447 A
+  step   300  nn_mean=2.8763 A  nn_min=2.7074 A  nn_std=0.0835 A
+  step   600  nn_mean=2.8632 A  nn_min=2.6036 A  nn_std=0.1115 A
+  step   900  nn_mean=2.7879 A  nn_min=2.4209 A  nn_std=0.1485 A
+  step  1200  nn_mean=2.8232 A  nn_min=2.5920 A  nn_std=0.1291 A
+  step  1500  nn_mean=2.8263 A  nn_min=2.5627 A  nn_std=0.1211 A
+
+=== Told T=3000K (matches melt training) -- same start structure (condition T=3000.0 K, actual thermostat T=300.0 K) ===
+  initial  nn_mean=2.9535 A  nn_min=2.8533 A  nn_std=0.0447 A
+  step   300  nn_mean=2.8705 A  nn_min=2.7128 A  nn_std=0.1013 A
+  step   600  nn_mean=2.8697 A  nn_min=2.5802 A  nn_std=0.1215 A
+  step   900  nn_mean=2.8095 A  nn_min=2.4381 A  nn_std=0.1694 A
+  step  1200  nn_mean=2.8295 A  nn_min=2.5899 A  nn_std=0.1363 A
+  step  1500  nn_mean=2.8403 A  nn_min=2.3045 A  nn_std=0.1742 A
