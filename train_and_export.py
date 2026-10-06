@@ -1,11 +1,21 @@
-"""test74: a single fixed-sigma denoising force field (same architecture and
-method as test70/test71) trained on BOTH the 8-atom SiO2 crystal AND the
-1000-atom SiO2 glass, by alternating which dataset each training step draws
-from. The network (DenoiserMPNN) has no atom-count-dependent parameters --
-it processes an arbitrary N via a per-step periodic radius graph -- so the
-SAME weights can in principle represent both regimes, if trained on both.
+"""test74: a single fixed-sigma denoising force field trained across
+SEVERAL real, genuinely distinct conditions -- crystal (cristobalite,
+300 K), melt (3000 K), a melt-quenched glass (300 K), and stishovite (a
+high-pressure SiO2 polymorph, 300 K) -- all generated locally (see
+make_small_multi_condition_data.py and make_stishovite_data.py). The
+network (DenoiserMPNN) has no atom-count-dependent parameters, so one set
+of weights can represent all regimes if trained on all of them.
+
+Conditioning is on TEMPERATURE ONLY (not pressure): all datasets so far
+were generated via NVT (no barostat), so there is no real, controlled
+pressure signal to condition on -- adding a P input would just be an
+unused, misleading extra dimension. T is also the physically dominant
+driver of which basin (crystal/melt/glass) the system sits in, so
+conditioning on T alone is a reasonable, honest simplification given the
+data generation method actually used.
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -13,54 +23,38 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import os
-
-# test74 (base): BOTH datasets are now N=1000 (CG beads), matched in size --
-# crystal is a real Vashishta NVT 300K trajectory of a 5x5x5 tiling of the
-# 8-atom primitive cell (see make_crystal_1000_data.py), replacing test72's
-# N=8 crystal data. Paths are relative to this file so the repo can be
-# cloned and run as-is on a supercomputer.
 REPO_DIR = Path(__file__).resolve().parent
-CRYSTAL_POSITIONS_PATH = REPO_DIR / "data_crystal_1000" / "positions.npy"
-CRYSTAL_MANIFEST_PATH = CRYSTAL_POSITIONS_PATH.parent / "manifest.npz"
-GLASS_POSITIONS_PATH = REPO_DIR / "data_glass_1000" / "positions.npy"
-GLASS_MANIFEST_PATH = GLASS_POSITIONS_PATH.parent / "manifest.npz"
-DEVICE = torch.device(os.environ.get("TEST73_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
-OUT_DIR = Path(__file__).resolve().parent / "output"
 
-# (P, T) conditions for each currently-available dataset, in physical units
-# (T in K, P in GPa) -- both existing datasets were generated at ambient
-# pressure, 300 K, so the conditioning mechanism is architecturally wired
-# up but not yet exercised across a real (P, T) range. Adding more
-# conditions (other polymorphs, melt, other pressures) only requires: (1)
-# generating that trajectory (see README.md's data plan), (2) adding its
-# (P, T) here, (3) adding it to the per-step dataset-choice logic below.
+# Each dataset: (name, nominal temperature in K for conditioning, relative
+# sampling probability). Add a new tuple here once a new condition's
+# trajectory + manifest have been generated under data_<name>/.
+DATASETS = [
+    ("crystal_300K", 300.0, 0.3),
+    ("melt_3000K", 3000.0, 0.2),
+    ("glass_300K", 300.0, 0.25),
+    ("stishovite_300K", 300.0, 0.25),
+]
+
 T_NORM_SCALE = 1000.0  # K
-P_NORM_SCALE = 10.0  # GPa
-CRYSTAL_CONDITION = (0.0 / P_NORM_SCALE, 300.0 / T_NORM_SCALE)
-GLASS_CONDITION = (0.0 / P_NORM_SCALE, 300.0 / T_NORM_SCALE)
+
+DEVICE = torch.device(os.environ.get("TEST73_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+OUT_DIR = REPO_DIR / "output"
 
 SIGMA_ANGSTROM = 0.15
-CUTOFF_ANGSTROM = 6.0  # both datasets are now N=1000 (cell ~34-36 A), so a
-# wider physical cutoff (1st+2nd Si-Si shells) fits safely under half the
-# smaller cell length
-HIDDEN_DIM = int(os.environ.get("TEST73_HIDDEN_DIM", 128))
-N_LAYERS = int(os.environ.get("TEST73_N_LAYERS", 4))
-CRYSTAL_BATCH_SIZE = int(os.environ.get("TEST73_BATCH_SIZE", 32))
-GLASS_BATCH_SIZE = int(os.environ.get("TEST73_BATCH_SIZE", 32))
-N_STEPS = int(os.environ.get("TEST73_N_STEPS", 50000))  # GPU on a supercomputer
-# affords both a bigger network and far more steps than the CPU runs in
-# test70-72; more steps than a single-dataset run: the network must
-# now fit two regimes with one set of weights
+CUTOFF_ANGSTROM = 5.5  # smallest cell here is the 192-atom crystal/melt/glass
+# box (~13.57 A); must stay comfortably under half that.
+HIDDEN_DIM = int(os.environ.get("TEST73_HIDDEN_DIM", 64))
+N_LAYERS = int(os.environ.get("TEST73_N_LAYERS", 3))
+BATCH_SIZE = int(os.environ.get("TEST73_BATCH_SIZE", 16))
+N_STEPS = int(os.environ.get("TEST73_N_STEPS", 15000))
 LEARNING_RATE = 3e-4
 GRAD_CLIP_NORM = 1.0
 SPIKE_ROLLBACK_FACTOR = 3.0
-GLASS_STEP_PROBABILITY = 0.5  # fraction of steps drawn from the glass dataset
 
 
-def load_positions_angstrom(path, manifest_path):
-    positions_nm = np.load(path)
-    manifest = np.load(manifest_path)
+def load_positions_angstrom(name):
+    positions_nm = np.load(REPO_DIR / f"data_{name}" / "positions.npy")
+    manifest = np.load(REPO_DIR / f"data_{name}" / "manifest.npz")
     cell_angstrom = manifest["cell_nm"].astype(np.float32) * 10.0
     return positions_nm.astype(np.float32) * 10.0, cell_angstrom
 
@@ -76,23 +70,16 @@ def periodic_radius_graph(pos: torch.Tensor, cell: torch.Tensor, cutoff: float):
 
 
 class DenoiserMPNN(nn.Module):
-    """test74: extends test70-73's DenoiserMPNN with (P, T) conditioning.
-    Every atom's initial embedding is now h0 + condition_mlp([P_norm,
-    T_norm]) instead of a single fixed learned vector -- this is what lets
-    ONE model represent crystal polymorphs, melt, and glass as different
-    points along a continuous (P, T) axis, rather than a handful of
-    disconnected named regimes. P and T should be normalized (e.g. T/1000K,
-    P/10GPa) before being passed in, so the conditioning MLP's input scale
-    is well-behaved regardless of the raw units used when the training
-    data was generated.
-    """
+    """test74: extends test70-73's DenoiserMPNN with TEMPERATURE
+    conditioning. Every atom's initial embedding is h0 +
+    condition_mlp([T_norm]) instead of a single fixed learned vector."""
 
     def __init__(self, hidden_dim: int, n_layers: int, cutoff: float):
         super().__init__()
         self.cutoff = cutoff
         self.h0 = nn.Parameter(torch.randn(hidden_dim) * 0.1)
         self.condition_mlp = nn.Sequential(
-            nn.Linear(2, hidden_dim), nn.SiLU(),
+            nn.Linear(1, hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.message_mlps = nn.ModuleList([
@@ -112,9 +99,7 @@ class DenoiserMPNN(nn.Module):
         )
 
     def forward(self, pos: torch.Tensor, cell: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """condition: (B, 2) tensor of (P_norm, T_norm), one (P, T) pair
-        per sample in the batch (shared across all atoms within that
-        sample, since P and T are macroscopic/global conditions)."""
+        """condition: (B, 1) tensor of T_norm, one value per sample."""
         batch_size, n_atoms, _ = pos.shape
         cond_embed = self.condition_mlp(condition)  # (B, hidden_dim)
         outputs = []
@@ -143,39 +128,35 @@ class DenoiserMPNN(nn.Module):
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    crystal_positions, crystal_cell = load_positions_angstrom(CRYSTAL_POSITIONS_PATH, CRYSTAL_MANIFEST_PATH)
-    glass_positions, glass_cell = load_positions_angstrom(GLASS_POSITIONS_PATH, GLASS_MANIFEST_PATH)
-    print(f"Crystal: {crystal_positions.shape[0]} frames, {crystal_positions.shape[1]} atoms, cell {crystal_cell}")
-    print(f"Glass:   {glass_positions.shape[0]} frames, {glass_positions.shape[1]} atoms, cell {glass_cell}")
-
+    loaded = {}
+    probs = []
+    cell_by_name = {}
+    for name, temp_k, prob in DATASETS:
+        pos, cell = load_positions_angstrom(name)
+        loaded[name] = (torch.tensor(pos, dtype=torch.float32, device=DEVICE),
+                         torch.tensor(cell, dtype=torch.float32, device=DEVICE))
+        cell_by_name[name] = cell
+        probs.append(prob)
+        print(f"{name}: {pos.shape[0]} frames, {pos.shape[1]} atoms, cell {cell}, T={temp_k} K")
+    probs = np.array(probs) / np.sum(probs)
     print(f"Using device: {DEVICE}")
-    crystal_t = torch.tensor(crystal_positions, dtype=torch.float32, device=DEVICE)
-    glass_t = torch.tensor(glass_positions, dtype=torch.float32, device=DEVICE)
-    crystal_cell_t = torch.tensor(crystal_cell, dtype=torch.float32, device=DEVICE)
-    glass_cell_t = torch.tensor(glass_cell, dtype=torch.float32, device=DEVICE)
 
     torch.manual_seed(0)
     model = DenoiserMPNN(HIDDEN_DIM, N_LAYERS, CUTOFF_ANGSTROM).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     losses = []
-    losses_by_kind = {"crystal": [], "glass": []}
+    losses_by_kind = {name: [] for name, _, _ in DATASETS}
     n_rollbacks = 0
     last_good_state = None
     t_start = time.time()
     step = 1
     while step <= N_STEPS:
-        is_glass = np.random.rand() < GLASS_STEP_PROBABILITY
-        if is_glass:
-            frame_idx = torch.randint(0, glass_t.shape[0], (GLASS_BATCH_SIZE,))
-            r = glass_t[frame_idx]
-            cell_t = glass_cell_t
-            condition = torch.tensor([GLASS_CONDITION] * GLASS_BATCH_SIZE, dtype=torch.float32, device=DEVICE)
-        else:
-            frame_idx = torch.randint(0, crystal_t.shape[0], (CRYSTAL_BATCH_SIZE,))
-            r = crystal_t[frame_idx]
-            cell_t = crystal_cell_t
-            condition = torch.tensor([CRYSTAL_CONDITION] * CRYSTAL_BATCH_SIZE, dtype=torch.float32, device=DEVICE)
+        name, temp_k, _ = DATASETS[np.random.choice(len(DATASETS), p=probs)]
+        positions_t, cell_t = loaded[name]
+        frame_idx = torch.randint(0, positions_t.shape[0], (BATCH_SIZE,))
+        r = positions_t[frame_idx]
+        condition = torch.full((BATCH_SIZE, 1), temp_k / T_NORM_SCALE, dtype=torch.float32, device=DEVICE)
 
         noise = torch.randn_like(r) * SIGMA_ANGSTROM
         r_noisy = r + noise
@@ -201,23 +182,24 @@ def main():
         optimizer.step()
 
         losses.append(loss_value)
-        losses_by_kind["glass" if is_glass else "crystal"].append(loss_value)
+        losses_by_kind[name].append(loss_value)
         if step % 20 == 0:
             last_good_state = (
                 {k: v.clone() for k, v in model.state_dict().items()},
                 optimizer.state_dict(), step,
             )
         if step % 200 == 0 or step == 1:
-            recent_c = np.mean(losses_by_kind["crystal"][-50:]) if losses_by_kind["crystal"] else float("nan")
-            recent_g = np.mean(losses_by_kind["glass"][-50:]) if losses_by_kind["glass"] else float("nan")
+            summary = "  ".join(
+                f"loss_{n}={np.mean(losses_by_kind[n][-50:]) if losses_by_kind[n] else float('nan'):.5f}"
+                for n, _, _ in DATASETS
+            )
             elapsed = time.time() - t_start
-            print(f"step {step:6d}/{N_STEPS}  loss_crystal={recent_c:.6f}  loss_glass={recent_g:.6f}  "
-                  f"elapsed={elapsed:.1f}s  rollbacks={n_rollbacks}", flush=True)
+            print(f"step {step:6d}/{N_STEPS}  {summary}  elapsed={elapsed:.1f}s  rollbacks={n_rollbacks}", flush=True)
             torch.save(
                 {"model_state": model.state_dict(), "sigma_angstrom": SIGMA_ANGSTROM,
                  "cutoff_angstrom": CUTOFF_ANGSTROM, "hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS,
-                 "crystal_cell_angstrom": crystal_cell, "glass_cell_angstrom": glass_cell,
-                 "step": step},
+                 "cell_by_name": cell_by_name, "temp_by_name": {n: t for n, t, _ in DATASETS},
+                 "t_norm_scale": T_NORM_SCALE, "step": step},
                 OUT_DIR / "checkpoint.pt",
             )
         step += 1
